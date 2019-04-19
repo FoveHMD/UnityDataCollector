@@ -70,7 +70,7 @@ public class FOVERecorder : MonoBehaviour
 
 	// A struct for recording in one place all the information that needs to be recorded for each frame
 	// If you need more data recorded, you can add more fields here. Just be sure to write is out as well later on.
-	class RecordingDatum
+	struct RecordingDatum
 	{
 		public float frameTime;
 		public UnityRay leftGaze;
@@ -211,6 +211,8 @@ public class FOVERecorder : MonoBehaviour
 	// The coroutine function which records data to the dataSlice List<> member
 	IEnumerator RecordData()
 	{
+		var nextFrameAwaiter = new WaitForEndOfFrame();
+
 		// Inifinite loops are okay within coroutines because the "yield" statement pauses the function each time to
 		// return control to the main program. Great for breaking tasks up into smaller chunks over time, or for doing
 		// small amounts of work each frame but potentially outside of the normal Update cycle/call order.
@@ -218,8 +220,6 @@ public class FOVERecorder : MonoBehaviour
 		{
 			// This statement pauses this function until Unity has finished rendering a frame. Inside the while loop,
 			// this means that this function will resume from here every frame.
-			yield return new WaitForEndOfFrame();
-
 			// If recording is stopped (which is it by default), loop back around next frame.
 			if (recordingStopped)
 				continue;
@@ -228,6 +228,7 @@ public class FOVERecorder : MonoBehaviour
 			// so you don't necessarily need to record head position and orientation just to transform the gaze vectors
 			// themselves. This data is pre-transformed for you.
 			var rays = fove.GetGazeRays();
+			yield return nextFrameAwaiter;
 
 			// If you add new fields, be sure to write them here.
 			RecordingDatum datum = new RecordingDatum
