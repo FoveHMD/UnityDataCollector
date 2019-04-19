@@ -7,11 +7,18 @@ using UnityEngine;
 using Fove.Unity;
 using Fove;
 using UnityRay = UnityEngine.Ray;
+using Stopwatch = System.Diagnostics.Stopwatch;
 
 // A behaviour class which records eye gaze data (with floating-point timestamps) and writes it out to a .csv file
 // for continued processing.
 public class FOVERecorder : MonoBehaviour
 {
+	public enum RecordingRate
+	{
+		_70FPS, // synch with vsynch
+		_120FPS, // synch with eye frame
+	}
+
 	// Require a reference (assigned via the Unity Inspector panel) to a FoveInterface object.
 	// This could be either FoveInterface
 	[Tooltip("This should be a reference to a FoveInterface object of the scene.")]
@@ -57,6 +64,10 @@ public class FOVERecorder : MonoBehaviour
 		forcePrecisionDigits = false
 	};
 
+	[Tooltip("Specify the rate at which gaze sampling is performed. 70FPS samples the gaze once every frame." +
+		"120FPS samples the gaze once every new incoming eye data")]
+	public RecordingRate recordingRate;
+
 	//=================//
 	// Private members //
 	//=================//
@@ -72,7 +83,7 @@ public class FOVERecorder : MonoBehaviour
 	// If you need more data recorded, you can add more fields here. Just be sure to write is out as well later on.
 	struct RecordingDatum
 	{
-		public float frameTime;
+		public double frameTime;
 		public UnityRay leftGaze;
 		public UnityRay rightGaze;
 	}
@@ -92,13 +103,27 @@ public class FOVERecorder : MonoBehaviour
 	private EventWaitHandle threadWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
 
 	// Track whether or not the write thread should live.
-	private bool threadShouldLive = true;
+	private bool writeThreadShouldLive = true;
+
+	// Track whether or not the write thread should live.
+	private bool collectThreadShouldLive = true;
 
 	// The thread object which we will call into the write thread function.
 	private Thread writeThread;
 
+	// The thread object which we will call into the write thread function.
+	private Thread collectThread;
+
+	private Headset headset;
+
+	private Stopwatch stopwatch = new Stopwatch(); // Unity Time.time can't be use outside of main thread.
+
 	// Use this for initialization.
 	void Start () {
+		stopwatch.Start();
+		if (!Stopwatch.IsHighResolution)
+			Debug.LogWarning("High precision stopwatch is not supported on this machine. Recorded frame times may not be highly accurate.");
+
 		// Check to make sure that the FOVE interface variable is assigned. This prevents a ton of errors
 		// from filling your log if you forget to assign the interface through the inspector.
 		if (fove == null)
@@ -107,6 +132,7 @@ public class FOVERecorder : MonoBehaviour
 			enabled = false;
 			return;
 		}
+		headset = FoveManager.GetFVRHeadset();
 
 		// We set the initial data slice capacity to the expected size + 1 so that we never waste time reallocating and
 		// copying data under the hood. If the system ever requires more than a single extra entry, there is likely
@@ -146,10 +172,20 @@ public class FOVERecorder : MonoBehaviour
 		vPrecision = "#0." + new string(precisionChar, recordingPrecision.vectorPrecision);
 		tPrecision = "#0." + new string(precisionChar, recordingPrecision.timePrecision);
 
-		// Coroutines give us a bit more control over when the call happens, and also simplify the code
-		// structure. However they are only ever called once per frame -- they processing to happen in
-		// pieces, but they shouldn't be confused with threads.
-		StartCoroutine(RecordData());
+		// if the recording rate is the same as the fove rendering rate,
+		// we use a coroutine to be sure that recorded gazes are synchronized with frames
+		if(recordingRate == RecordingRate._70FPS)
+		{
+			// Coroutines give us a bit more control over when the call happens, and also simplify the code
+			// structure. However they are only ever called once per frame -- they processing to happen in
+			// pieces, but they shouldn't be confused with threads.
+			StartCoroutine(RecordDataCoroutine());
+		}
+		else // otherwise we just start a vsynch asynchronous thread
+		{
+			collectThread = new Thread(CollectThreadFunc);
+			collectThread.Start();
+		}
 
 		// Create the write thread to call "WriteThreadFunc", and then start it.
 		writeThread = new Thread(WriteThreadFunc);
@@ -170,32 +206,36 @@ public class FOVERecorder : MonoBehaviour
 	// This is called when the program quits, or when you press the stop button in the editor (if running from there).
 	void OnApplicationQuit()
 	{
-		if (writeThread == null)
-			return;
+		recordingStopped = true;
+		collectThreadShouldLive = false;
+		collectThread?.Join(100);
 
-		// Get a lock to the mutex to make sure data isn't being written. Wait up to 200 milliseconds.
-		if (writingDataMutex.WaitOne(200))
+		if (writeThread != null)
 		{
-			// Tell the thread to end, then release the mutex so it can finish.
-			threadShouldLive = false;
+			// Get a lock to the mutex to make sure data isn't being written. Wait up to 200 milliseconds.
+			if (writingDataMutex.WaitOne(200))
+			{
+				// Tell the thread to end, then release the mutex so it can finish.
+				writeThreadShouldLive = false;
 
-			CheckForNullDataToWrite();
-			dataToWrite = dataSlice;
-			dataSlice = null;
+				CheckForNullDataToWrite();
+				dataToWrite = dataSlice;
+				dataSlice = null;
 
-			writingDataMutex.ReleaseMutex();
+				writingDataMutex.ReleaseMutex();
 
-			if (!threadWaitHandle.Set())
-				Debug.LogError("Error setting the event to wake up the file writer thread on application quit");
+				if (!threadWaitHandle.Set())
+					Debug.LogError("Error setting the event to wake up the file writer thread on application quit");
+			}
+			else
+			{
+				// If it times out, tell the operating system to abort the thread.
+				writeThread.Abort();
+			}
+
+			// Wait for the write thrtead to end (up to 1 second).
+			writeThread.Join(1000);
 		}
-		else
-		{
-			// If it times out, tell the operating system to abort the thread.
-			writeThread.Abort();
-		}
-
-		// Wait for the write thrtead to end (up to 1 second).
-		writeThread.Join(1000);
 	}
 	
 	void CheckForNullDataToWrite()
@@ -208,8 +248,62 @@ public class FOVERecorder : MonoBehaviour
 		}
 	}
 
+	private void RecordDatum()
+	{
+		// If recording is stopped (which is it by default), loop back around next frame.
+		if (recordingStopped)
+			return;
+
+		// The FoveInterfaceBase.EyeRays struct contains world-space rays indicating eye gaze origin and direction,
+		// so you don't necessarily need to record head position and orientation just to transform the gaze vectors
+		// themselves. This data is pre-transformed for you.
+		var rays = fove.GetGazeRays_Immediate();
+
+		// If you add new fields, be sure to write them here.
+		var datum = new RecordingDatum
+		{
+			frameTime = stopwatch.Elapsed.TotalSeconds,
+			leftGaze = rays.left,
+			rightGaze = rays.right,
+		};
+		dataSlice.Add(datum);
+
+		if (dataSlice.Count >= writeAtDataCount)
+		{
+			// Make sure we have exclusive access by locking the mutex, but only wait for up to 30 milliseconds.
+			if (!writingDataMutex.WaitOne(30))
+			{
+				// If we got here, it means that we couldn't acquire exclusive access within the specified time
+				// limit. Likely this means an error happened, but it could also mean that more data was being
+				// written than it took to gather another set of data -- in which case you may need to extend the
+				// timeout duration, though that will cause a noticeable frame skip in your application.
+
+				// For now, the best thing we can do is continue the loop and try writing data again next frame.
+				long excess = dataSlice.Count - writeAtDataCount;
+				if (excess > 1)
+					Debug.LogError("Data slice is " + excess + " entries over where it should be; this is" +
+								   "indicative of a major performance concern in the data recording and writing" +
+								   "process.");
+				return;
+			}
+
+			CheckForNullDataToWrite();
+
+			// Move our current slice over to dataToWrite, and then create a new slice.
+			dataToWrite = dataSlice;
+			dataSlice = new List<RecordingDatum>((int)(writeAtDataCount + 1));
+
+			// Release our claim on the mutex.
+			writingDataMutex.ReleaseMutex();
+
+			if (!threadWaitHandle.Set())
+				Debug.LogError("Error setting the event to wake up the file writer thread");
+
+		}
+	}
+
 	// The coroutine function which records data to the dataSlice List<> member
-	IEnumerator RecordData()
+	IEnumerator RecordDataCoroutine()
 	{
 		var nextFrameAwaiter = new WaitForEndOfFrame();
 
@@ -220,57 +314,22 @@ public class FOVERecorder : MonoBehaviour
 		{
 			// This statement pauses this function until Unity has finished rendering a frame. Inside the while loop,
 			// this means that this function will resume from here every frame.
-			// If recording is stopped (which is it by default), loop back around next frame.
-			if (recordingStopped)
-				continue;
-
-			// The FoveInterfaceBase.EyeRays struct contains world-space rays indicating eye gaze origin and direction,
-			// so you don't necessarily need to record head position and orientation just to transform the gaze vectors
-			// themselves. This data is pre-transformed for you.
-			var rays = fove.GetGazeRays();
 			yield return nextFrameAwaiter;
 
-			// If you add new fields, be sure to write them here.
-			RecordingDatum datum = new RecordingDatum
-			{
-				frameTime = Time.time,
-				leftGaze = rays.left,
-				rightGaze = rays.right
-			};
+			RecordDatum();
+		}
+	}
 
-			dataSlice.Add(datum);
+	// This is the collecting thread that collect and store data asynchronously from the rendering
+	private void CollectThreadFunc()
+	{
+		while (collectThreadShouldLive)
+		{
+			RecordDatum();
 
-			if (dataSlice.Count >= writeAtDataCount)
-			{
-				// Make sure we have exclusive access by locking the mutex, but only wait for up to 30 milliseconds.
-				if (!writingDataMutex.WaitOne(30))
-				{
-					// If we got here, it means that we couldn't acquire exclusive access within the specified time
-					// limit. Likely this means an error happened, but it could also mean that more data was being
-					// written than it took to gather another set of data -- in which case you may need to extend the
-					// timeout duration, though that will cause a noticeable frame skip in your application.
-
-					// For now, the best thing we can do is continue the loop and try writing data again next frame.
-					long excess = dataSlice.Count - writeAtDataCount;
-					if (excess > 1)
-						Debug.LogError("Data slice is " + excess + " entries over where it should be; this is" +
-						               "indicative of a major performance concern in the data recording and writing" +
-						               "process.");
-					continue;
-				}
-
-				CheckForNullDataToWrite();
-
-				// Move our current slice over to dataToWrite, and then create a new slice.
-				dataToWrite = dataSlice;
-				dataSlice = new List<RecordingDatum>((int)(writeAtDataCount + 1));
-
-				// Release our claim on the mutex.
-				writingDataMutex.ReleaseMutex();
-
-				if (!threadWaitHandle.Set())
-					Debug.LogError("Error setting the event to wake up the file writer thread");
-			}
+			var error = headset.WaitForNextEyeFrame();
+			if (error != ErrorCode.None)
+				Debug.LogError("An error happened while waiting for next eye frame. Error code:" + error);
 		}
 	}
 
@@ -316,7 +375,7 @@ public class FOVERecorder : MonoBehaviour
 				File.AppendAllText(fileName, text);
 			} catch (Exception e) {
 				Debug.LogWarning("Exception writing to data file:\n" + e);
-				threadShouldLive = false;
+				writeThreadShouldLive = false;
 			}
 
 			dataToWrite = null;
@@ -329,7 +388,7 @@ public class FOVERecorder : MonoBehaviour
 	// performance inside the Unity game loop, and thus more likely to have accurate, consistent results.
 	private void WriteThreadFunc()
 	{
-		while (threadShouldLive)
+		while (writeThreadShouldLive)
 		{
 			if (threadWaitHandle.WaitOne())
 				WriteDataFromThread();
