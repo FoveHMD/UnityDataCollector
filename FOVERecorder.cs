@@ -4,15 +4,18 @@ using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using UnityEngine;
+using Fove.Unity;
+using Fove;
+using UnityRay = UnityEngine.Ray;
 
 // A behaviour class which records eye gaze data (with floating-point timestamps) and writes it out to a .csv file
 // for continued processing.
 public class FOVERecorder : MonoBehaviour
 {
-	// Require a reference (assigned via the Unity Inspector panel) to a FoveInterfaceBase object.
-	// This could be either FoveInterface or FoveInterface2.
-	[Tooltip("This should be a reference to any FoveInterface or FoveInterface2 object in the scene.")]
-	public FoveInterfaceBase fove = null;
+	// Require a reference (assigned via the Unity Inspector panel) to a FoveInterface object.
+	// This could be either FoveInterface
+	[Tooltip("This should be a reference to a FoveInterface object of the scene.")]
+	public FoveInterface fove = null;
 
 	// Pick a key (customizable via the Inspector panel) to toggle recording.
 	[Tooltip("Pressing this key will toggle data recording.")]
@@ -23,8 +26,7 @@ public class FOVERecorder : MonoBehaviour
 	public uint writeAtDataCount = 1000;
 
 	// The name of the file to write our results into
-	[Tooltip("The base name of the file. Don't add any extensions, as \".csv\" will be appended to whatever you put " +
-	         "here.")]
+	[Tooltip("The base name of the file. Don't add any extensions, as \".csv\" will be appended to whatever you put here.")]
 	public string fileName = "fove_recorded_results";
 
 	// Check this to overwrite existing data files rather than incrementing a value each time.
@@ -35,11 +37,14 @@ public class FOVERecorder : MonoBehaviour
 	[Serializable]
 	public struct RecordingPrecision_struct
 	{
+		[Range(1, 10)]
 		[Tooltip("How many digits of decimal precision to record")]
 		public int timePrecision;
 
+		[Range(1, 10)]
 		[Tooltip("How many digits of decimal precision to use when writing vector data")]
 		public int vectorPrecision;
+
 		[Tooltip("Forces unused decimal precision to be written out with zeros, for instance, 4 rpecision digits " +
 		         "and a value of 0.12 would be written \"0.1200\"")]
 		public bool forcePrecisionDigits;
@@ -68,8 +73,8 @@ public class FOVERecorder : MonoBehaviour
 	class RecordingDatum
 	{
 		public float frameTime;
-		public Ray leftGaze;
-		public Ray rightGaze;
+		public UnityRay leftGaze;
+		public UnityRay rightGaze;
 	}
 
 	// A list for storing the recorded data from many frames
