@@ -6,17 +6,56 @@ using System.Threading;
 using UnityEngine;
 using Fove.Unity;
 using Fove;
-using UnityRay = UnityEngine.Ray;
 using Stopwatch = System.Diagnostics.Stopwatch;
+
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
+
+public class ScriptExecutionOrder : Attribute
+{
+	public int order;
+	public ScriptExecutionOrder(int order) { this.order = order; }
+}
+
+#if UNITY_EDITOR
+[InitializeOnLoad]
+public class ScriptExecutionOrderManager
+{
+	static ScriptExecutionOrderManager()
+	{
+		foreach (MonoScript monoScript in MonoImporter.GetAllRuntimeMonoScripts())
+		{
+			if (monoScript.GetClass() == null)
+				continue;
+
+			foreach (var attr in Attribute.GetCustomAttributes(monoScript.GetClass(), typeof(ScriptExecutionOrder)))
+			{
+				var newOrder = ((ScriptExecutionOrder)attr).order;
+				if (MonoImporter.GetExecutionOrder(monoScript) != newOrder)
+					MonoImporter.SetExecutionOrder(monoScript, newOrder);
+			}
+		}
+	}
+}
+#endif
 
 // A behaviour class which records eye gaze data (with floating-point timestamps) and writes it out to a .csv file
 // for continued processing.
+[ScriptExecutionOrder(1000)] // execute last so that user current frame transformations on the fove interface pose are included
 public class FOVERecorder : MonoBehaviour
 {
 	public enum RecordingRate
 	{
 		_70FPS, // synch with vsynch
 		_120FPS, // synch with eye frame
+	}
+
+	public enum CoordinateSpace
+	{
+		World,
+		Local,
+		HMD,
 	}
 
 	// Require a reference (assigned via the Unity Inspector panel) to a FoveInterface object.
@@ -68,6 +107,9 @@ public class FOVERecorder : MonoBehaviour
 		"120FPS samples the gaze once every new incoming eye data")]
 	public RecordingRate recordingRate;
 
+	[Tooltip("Specify the coordinate space used for gaze rays.")]
+	public CoordinateSpace raysCoordinateSpace;
+
 	//=================//
 	// Private members //
 	//=================//
@@ -84,8 +126,8 @@ public class FOVERecorder : MonoBehaviour
 	struct RecordingDatum
 	{
 		public double frameTime;
-		public UnityRay leftGaze;
-		public UnityRay rightGaze;
+		public Ray leftGaze;
+		public Ray rightGaze;
 	}
 
 	// A list for storing the recorded data from many frames
@@ -116,6 +158,14 @@ public class FOVERecorder : MonoBehaviour
 
 	private Headset headset;
 
+	// Fove interface transformation matrices
+	private class TransformationMatrices
+	{
+		public Matrix4x4 HMDToLocal;
+		public Matrix4x4 HMDToWorld;
+	}
+	private TransformationMatrices foveInterfaceTransfo = new TransformationMatrices();
+
 	private Stopwatch stopwatch = new Stopwatch(); // Unity Time.time can't be use outside of main thread.
 
 	// Use this for initialization.
@@ -132,7 +182,7 @@ public class FOVERecorder : MonoBehaviour
 			enabled = false;
 			return;
 		}
-		headset = FoveManager.GetFVRHeadset();
+		headset = FoveManager.Headset;
 
 		// We set the initial data slice capacity to the expected size + 1 so that we never waste time reallocating and
 		// copying data under the hood. If the system ever requires more than a single extra entry, there is likely
@@ -171,25 +221,12 @@ public class FOVERecorder : MonoBehaviour
 		char precisionChar = recordingPrecision.forcePrecisionDigits ? '0' : '#';
 		vPrecision = "#0." + new string(precisionChar, recordingPrecision.vectorPrecision);
 		tPrecision = "#0." + new string(precisionChar, recordingPrecision.timePrecision);
-
-		// if the recording rate is the same as the fove rendering rate,
-		// we use a coroutine to be sure that recorded gazes are synchronized with frames
-		if(recordingRate == RecordingRate._70FPS)
-		{
-			// Coroutines give us a bit more control over when the call happens, and also simplify the code
-			// structure. However they are only ever called once per frame -- they processing to happen in
-			// pieces, but they shouldn't be confused with threads.
-			StartCoroutine(RecordDataCoroutine());
-		}
-		else // otherwise we just start a vsynch asynchronous thread
-		{
-			collectThread = new Thread(CollectThreadFunc);
-			collectThread.Start();
-		}
-
+		
 		// Create the write thread to call "WriteThreadFunc", and then start it.
 		writeThread = new Thread(WriteThreadFunc);
 		writeThread.Start();
+
+		StartCoroutine(JobsSpawnerCoroutine());
 	}
 
 	// Unity's standard Update function, here used only to listen for input to toggle data recording
@@ -208,7 +245,8 @@ public class FOVERecorder : MonoBehaviour
 	{
 		recordingStopped = true;
 		collectThreadShouldLive = false;
-		collectThread?.Join(100);
+		if(collectThread != null)
+			collectThread.Join(100);
 
 		if (writeThread != null)
 		{
@@ -237,7 +275,30 @@ public class FOVERecorder : MonoBehaviour
 			writeThread.Join(1000);
 		}
 	}
-	
+	IEnumerator JobsSpawnerCoroutine()
+	{
+		// ensure that the headset is connected and ready before starting any recording
+		var nextFrameAwaiter = new WaitForEndOfFrame();
+		while (!FoveManager.IsHardwareConnected())
+			yield return nextFrameAwaiter;
+
+		// if the recording rate is the same as the fove rendering rate,
+		// we use a coroutine to be sure that recorded gazes are synchronized with frames
+		if (recordingRate == RecordingRate._70FPS)
+		{
+			// Coroutines give us a bit more control over when the call happens, and also simplify the code
+			// structure. However they are only ever called once per frame -- they processing to happen in
+			// pieces, but they shouldn't be confused with threads.
+			StartCoroutine(RecordDataCoroutine());
+		}
+		else // otherwise we just start a vsynch asynchronous thread
+		{
+			StartCoroutine(RecordFoveTransformCoroutine());
+			collectThread = new Thread(CollectThreadFunc);
+			collectThread.Start();
+		}
+	}
+
 	void CheckForNullDataToWrite()
 	{
 		// The write thread sets dataToWrite to null when it's done, so if it isn't null here, it's likely
@@ -248,23 +309,77 @@ public class FOVERecorder : MonoBehaviour
 		}
 	}
 
-	private void RecordDatum()
+	private void UpdateFoveInterfaceMatrices(bool immediate)
+	{
+		var t = fove.transform;
+
+		if (immediate)
+		{
+			// In the case of 120 FPS recording rate, we re-fetch the HMD latest pose
+			// and localy recalculate the fove interface local transform
+			var pose = FoveManager.GetHMDPose(true);
+			var isStanding = fove.poseType == FovePoseToUse.Standing;
+			var hmdAdjustedPosition = (isStanding ? pose.standingPosition : pose.position).ToVector3();
+			var localPos = fove.fetchPosition? hmdAdjustedPosition : t.position;
+			var localRot = fove.fetchOrientation? pose.orientation.ToQuaternion() : t.rotation;
+
+			var parentTransfo = t.parent != null ? t.parent.localToWorldMatrix : Matrix4x4.identity;
+			var localTransfo = Matrix4x4.TRS(localPos, localRot, t.localScale);
+
+			lock (foveInterfaceTransfo)
+			{
+				foveInterfaceTransfo.HMDToWorld = parentTransfo * localTransfo;
+				foveInterfaceTransfo.HMDToLocal = localTransfo;
+			}
+		}
+		else
+		{
+			// no need to lock the object, we are in synchronize mode (access from the same thread)
+			foveInterfaceTransfo.HMDToWorld = t.localToWorldMatrix;
+			foveInterfaceTransfo.HMDToLocal = Matrix4x4.TRS(t.localPosition, t.localRotation, t.localScale);
+		}
+	}
+
+	private void RecordDatum(bool immediate)
 	{
 		// If recording is stopped (which is it by default), loop back around next frame.
 		if (recordingStopped)
 			return;
 
-		// The FoveInterfaceBase.EyeRays struct contains world-space rays indicating eye gaze origin and direction,
-		// so you don't necessarily need to record head position and orientation just to transform the gaze vectors
-		// themselves. This data is pre-transformed for you.
-		var rays = fove.GetGazeRays_Immediate();
+		if (!immediate) // we run in the same thread as unity we can update the transformations in a synchronized way
+			UpdateFoveInterfaceMatrices(false);
+		
+		Matrix4x4 transformMat;
+		lock (foveInterfaceTransfo)
+		{
+			switch (raysCoordinateSpace)
+			{
+				case CoordinateSpace.World:
+					transformMat = foveInterfaceTransfo.HMDToWorld;
+					break;
+				case CoordinateSpace.Local:
+					transformMat = foveInterfaceTransfo.HMDToLocal;
+					break;
+				default:
+					transformMat = Matrix4x4.identity;
+					break;
+			}
+		}
+
+		var leftEyeOffset = FoveManager.GetLeftEyeOffset(immediate);
+		var rightEyeOffset = FoveManager.GetRightEyeOffset(immediate);
+		var leftEyeVector = FoveManager.GetLeftEyeVector(immediate);
+		var rightEyeVector = FoveManager.GetRightEyeVector(immediate);
+
+		Ray leftRay, rightRay;
+		Utils.CalculateGazeRays(ref transformMat, ref leftEyeVector, ref rightEyeVector, ref leftEyeOffset, ref rightEyeOffset, out leftRay, out rightRay);
 
 		// If you add new fields, be sure to write them here.
 		var datum = new RecordingDatum
 		{
 			frameTime = stopwatch.Elapsed.TotalSeconds,
-			leftGaze = rays.left,
-			rightGaze = rays.right,
+			leftGaze = leftRay,
+			rightGaze = rightRay,
 		};
 		dataSlice.Add(datum);
 
@@ -316,7 +431,19 @@ public class FOVERecorder : MonoBehaviour
 			// this means that this function will resume from here every frame.
 			yield return nextFrameAwaiter;
 
-			RecordDatum();
+			RecordDatum(false);
+		}
+	}
+	
+	// this coroutine is used to fetch the fove interface transformation value from the unity main thread
+	IEnumerator RecordFoveTransformCoroutine()
+	{
+		var nextFrameAwaiter = new WaitForEndOfFrame();
+
+		while (true)
+		{
+			UpdateFoveInterfaceMatrices(true);
+			yield return nextFrameAwaiter;
 		}
 	}
 
@@ -325,7 +452,7 @@ public class FOVERecorder : MonoBehaviour
 	{
 		while (collectThreadShouldLive)
 		{
-			RecordDatum();
+			RecordDatum(true);
 
 			var error = headset.WaitForNextEyeFrame();
 			if (error != ErrorCode.None)
