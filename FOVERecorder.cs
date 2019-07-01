@@ -318,7 +318,7 @@ public class FOVERecorder : MonoBehaviour
 			// In the case of 120 FPS recording rate, we re-fetch the HMD latest pose
 			// and localy recalculate the fove interface local transform
 			var pose = FoveManager.GetHMDPose(true);
-			var isStanding = fove.poseType == FovePoseToUse.Standing;
+			var isStanding = fove.poseType == FoveInterface.PlayerPose.Standing;
 			var hmdAdjustedPosition = (isStanding ? pose.standingPosition : pose.position).ToVector3();
 			var localPos = fove.fetchPosition? hmdAdjustedPosition : t.position;
 			var localRot = fove.fetchOrientation? pose.orientation.ToQuaternion() : t.rotation;
